@@ -492,3 +492,180 @@ def test_gate_does_not_modify_report(client):
     assert after["report"] == analysis["report"]
     assert after["old_schema"] == analysis["old_schema"]
     assert after["new_schema"] == analysis["new_schema"]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/profile 合规画像
+# ---------------------------------------------------------------------------
+
+PROFILE_SCHEMA_OLD = {"type": "object"}
+PROFILE_SCHEMA_NEW = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "age": {"type": "integer", "minimum": 0},
+        "kind": {
+            "oneOf": [
+                {"type": "object",
+                 "properties": {"t": {"const": "a"}, "v": {"type": "string"}},
+                 "required": ["t", "v"]},
+                {"type": "object",
+                 "properties": {"t": {"const": "b"}, "v": {"type": "integer"}},
+                 "required": ["t", "v"]},
+            ]
+        },
+    },
+    "required": ["name", "age"],
+    "additionalProperties": False,
+}
+
+
+def _profile_analysis(client):
+    return _create(client, PROFILE_SCHEMA_OLD, PROFILE_SCHEMA_NEW, "profile-case")
+
+
+def test_profile_validates_against_new_schema(client):
+    analysis = _profile_analysis(client)
+    documents = [
+        {"name": "ok", "age": 3, "kind": {"t": "a", "v": "x"}},  # 合规
+        {"age": 1, "name": 2},                                    # name 类型错
+        {"name": "z", "age": 1, "kind": {"t": "a", "v": 7}},      # oneOf 失败
+    ]
+    resp = client.post(f"/api/analyses/{analysis['id']}/profile",
+                       json={"documents": documents})
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    assert data["analysis_id"] == analysis["id"]
+    assert data["version"] == 1
+    assert data["total_documents"] == 3
+    assert data["valid_documents"] == 1
+    assert data["invalid_documents"] == 2
+    assert data["compliance_rate"] == 1 / 3
+    for group in data["failures"]:
+        assert len(group["fingerprint"]) == 16
+        assert group["pointer"].startswith("#")
+        assert group["count"] >= 1
+        assert group["example_indices"] == sorted(group["example_indices"])
+
+    # oneOf 失败归并到最深公共路径 #/kind
+    kind = [g for g in data["failures"] if g["pointer"] == "#/kind"]
+    assert len(kind) == 1
+    assert kind[0]["validator"] == "oneOf"
+    assert kind[0]["count"] == 1
+    assert kind[0]["example_indices"] == [2]
+
+    # 关联持久化：GET 最新快照与 POST 返回一致
+    resp2 = client.get(f"/api/analyses/{analysis['id']}/profile")
+    assert resp2.status_code == 200
+    assert resp2.json() == data
+
+
+def test_profile_versions_increment_and_listing(client):
+    analysis = _profile_analysis(client)
+    base = f"/api/analyses/{analysis['id']}"
+
+    first = client.post(base + "/profile", json={"documents": [{"name": "a", "age": 1}]}).json()
+    second = client.post(base + "/profile", json={"documents": [{"name": "b", "age": 2}]}).json()
+    assert first["version"] == 1
+    assert second["version"] == 2
+    assert first["id"] != second["id"]
+
+    # GET 最新返回 version=2
+    latest = client.get(base + "/profile").json()
+    assert latest["version"] == 2
+
+    # 按 ID 取指定快照
+    by_id = client.get(f"{base}/profiles/{first['id']}").json()
+    assert by_id["version"] == 1
+
+    # 列表
+    resp = client.get(base + "/profiles")
+    assert resp.status_code == 200
+    listing = resp.json()
+    assert listing["analysis_id"] == analysis["id"]
+    assert listing["total"] == 2
+    assert [item["version"] for item in listing["items"]] == [2, 1]
+    summary = listing["items"][0]
+    assert summary["total_documents"] == 1
+    assert summary["valid_documents"] == 1
+    assert summary["compliance_rate"] == 1.0
+    assert summary["failure_groups"] == 0
+
+
+def test_profile_order_independent_grouping(client):
+    analysis = _profile_analysis(client)
+    base = f"/api/analyses/{analysis['id']}"
+    documents = [
+        {"name": "y", "age": 1, "kind": {"t": "a", "v": 1}},
+        {"name": "z", "age": 2, "kind": {"t": "a", "v": 2}},
+        {"age": 3, "name": 4},
+    ]
+    a = client.post(base + "/profile", json={"documents": documents}).json()
+    b = client.post(base + "/profile", json={"documents": list(reversed(documents))}).json()
+
+    def fingerprint(result):
+        return [(g["pointer"], g["validator"], g["fingerprint"], g["count"],
+                 g["message"]) for g in result["failures"]]
+
+    assert fingerprint(a) == fingerprint(b)
+
+
+def test_profile_too_many_documents_returns_422_and_writes_nothing(client):
+    analysis = _profile_analysis(client)
+    base = f"/api/analyses/{analysis['id']}"
+
+    # 5001 个文档 -> 422，且不写画像记录
+    resp = client.post(base + "/profile",
+                       json={"documents": [{"name": "x", "age": 1}] * 5001})
+    assert resp.status_code == 422
+
+    listing = client.get(base + "/profiles").json()
+    assert listing["total"] == 0
+    assert client.get(base + "/profile").status_code == 404
+
+    # 空文档列表也 422
+    assert client.post(base + "/profile", json={"documents": []}).status_code == 422
+
+
+def test_profile_non_object_document_returns_422_and_writes_nothing(client):
+    analysis = _profile_analysis(client)
+    base = f"/api/analyses/{analysis['id']}"
+
+    for bad in ([1, 2, 3], ["str"], [None], [True], [[]]):
+        resp = client.post(base + "/profile", json={"documents": bad})
+        assert resp.status_code == 422, bad
+
+    # 混合列表中只要有非对象就 422
+    resp = client.post(base + "/profile",
+                       json={"documents": [{"name": "x", "age": 1}, "not-an-object"]})
+    assert resp.status_code == 422
+
+    listing = client.get(base + "/profiles").json()
+    assert listing["total"] == 0
+
+
+def test_profile_does_not_modify_analysis(client):
+    analysis = _profile_analysis(client)
+    client.post(f"/api/analyses/{analysis['id']}/profile",
+                json={"documents": [{"name": "x", "age": 1}]})
+    after = client.get(f"/api/analyses/{analysis['id']}").json()
+    assert after["report"] == analysis["report"]
+    assert after["new_schema"] == analysis["new_schema"]
+    assert after["old_schema"] == analysis["old_schema"]
+
+
+def test_profile_missing_analysis_returns_404(client):
+    assert client.post("/api/analyses/999999/profile",
+                       json={"documents": [{}]}).status_code == 404
+    assert client.get("/api/analyses/999999/profile").status_code == 404
+    assert client.get("/api/analyses/999999/profiles").status_code == 404
+
+
+def test_profile_cross_analysis_id_is_404(client):
+    a1 = _profile_analysis(client)
+    a2 = _profile_analysis(client)
+    created = client.post(f"/api/analyses/{a1['id']}/profile",
+                          json={"documents": [{"name": "x", "age": 1}]}).json()
+    # 画像属于 a1，用 a2 的命名空间访问 -> 404
+    resp = client.get(f"/api/analyses/{a2['id']}/profiles/{created['id']}")
+    assert resp.status_code == 404

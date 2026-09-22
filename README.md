@@ -17,8 +17,9 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
+│   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
 │   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
@@ -27,6 +28,7 @@
 │   └── schemas.py       # Pydantic 请求 / 响应模型
 ├── tests/
 │   ├── test_compat.py   # 引擎单元测试（含 if/then/else 条件分支用例）
+│   ├── test_profile.py  # 合规画像引擎单元测试（最深公共失败路径 / 指纹 / 顺序无关）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -554,6 +556,135 @@ curl -X POST http://localhost:8000/api/analyses/1/gate \
 
 请求体不合法（如 `directions` 为空、规则 `path` 不是合法 JSON Pointer、
 上限为负数）返回 `422`。
+
+### `POST /api/analyses/{id}/profile` — 新 schema 批量文档合规画像
+
+用分析记录保存的**新 schema**（`new_schema`）对最多 **5000** 个待检 JSON
+文档逐个校验，返回合规率与按 JSON Pointer 归并的失败计数 / 示例下标，
+并把**画像快照关联分析记录持久化**（同一分析下版本号从 1 递增）。
+画像为追加写入，绝不修改原分析记录；分析编号不存在返回 `404`。
+
+请求体：
+
+| 字段        | 类型     | 必填 | 说明                                        |
+| ----------- | -------- | ---- | ------------------------------------------- |
+| `documents` | object[] | 是   | 待检 JSON 文档（必须全部为对象），数量 1..5000 |
+
+**入参校验（返回 `422` 且不写入任何画像记录）**：
+
+- 文档数量超过 5000 或为空列表；
+- 任一文档不是 JSON 对象（数字 / 字符串 / 布尔 / `null` / 数组均拒绝，
+  即使与合法对象混在同一批中也整批拒绝）。
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/profile \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [
+    {"name": "ok", "age": 3},
+    {"age": -1},
+    {"name": 5, "age": 1}
+  ]}'
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "analysis_id": 1,
+  "version": 1,
+  "created_at": "2026-09-22T10:00:00+00:00",
+  "total_documents": 3,
+  "valid_documents": 1,
+  "invalid_documents": 2,
+  "compliance_rate": 0.3333333333333333,
+  "failures": [
+    {
+      "fingerprint": "36272e41e33a701e",
+      "pointer": "#/age",
+      "validator": "minimum",
+      "schema_pointer": "#/properties/age/minimum",
+      "message": "数值必须大于等于 0",
+      "count": 1,
+      "example_indices": [1]
+    },
+    {
+      "fingerprint": "7342d4b7bd2e70e7",
+      "pointer": "#/name",
+      "validator": "type",
+      "schema_pointer": "#/properties/name/type",
+      "message": "值的类型必须为 string",
+      "count": 1,
+      "example_indices": [2]
+    }
+  ]
+}
+```
+
+响应字段：
+
+| 字段               | 说明                                                           |
+| ------------------ | -------------------------------------------------------------- |
+| `compliance_rate`  | 合规率 = `valid_documents / total_documents`                   |
+| `failures[].pointer` | 失败位置（JSON Pointer，根为 `#`），oneOf/anyOf 为最深公共失败路径 |
+| `failures[].validator` | jsonschema 规则名（`required` / `type` / `oneOf` …）          |
+| `failures[].schema_pointer` | schema 中触发规则的位置（仅排查用，不参与指纹）         |
+| `failures[].fingerprint` | 稳定规则指纹（SHA-256 前 16 位），同类问题合并到同一组      |
+| `failures[].count` | 命中该问题的文档数（每个文档在同一组内最多计一次）             |
+| `failures[].example_indices` | 示例文档下标（基于提交顺序，从 0 开始，升序且有界） |
+
+#### oneOf / anyOf 嵌套错误与稳定指纹
+
+`oneOf` / `anyOf` 失败时 jsonschema 返回的是一棵分支错误树。画像引擎会
+**递归收集全部叶子失败**，取叶子实例路径的**最长公共前缀**作为
+`pointer`：
+
+- 所有分支都在同一深层位置失败（如都失败在 `#/kind/v`）→ 定位到该
+  深层位置；
+- 分支在不同位置失败（`#/a` 与 `#/b`）→ 回退到公共祖先（可能为根 `#`）。
+
+若所有叶子的规则与规则主体一致（如三个分支的 `#/a` 都是 `type`
+失败），用叶子规则（`type`）代表整棵子树；否则以组合关键字
+（`oneOf` / `anyOf`）作为规则。
+
+**稳定规则指纹**的输入为：失败位置（pointer）+ 规则（validator）+
+规则主体（subject）。规则主体只保留与 schema 声明绑定的信息
+（`required` 取缺失字段名、`additionalProperties` 取未允许的键名，
+其余规则为空），从而剔除实例取值、数组长度、枚举实际值、命中分支
+下标等数据噪声——不同文档违反同一条 schema 规则时合并到同一组。
+指纹为 SHA-256 前 16 位（字段间以 `\x1f` 分隔）。
+
+**输入顺序不影响分组结果**：分组按 (pointer, validator,
+schema_pointer, 指纹) 稳定排序；`example_indices` 始终以提交下标升序
+表示，因此打乱文档顺序只会改变示例下标本身，分组、计数与消息不变。
+失败消息只描述规则（如"数值必须大于等于 0"），不含实例实际取值。
+
+#### 画像快照查询接口
+
+| 方法 & 路径 | 说明 |
+| ----------- | ---- |
+| `GET /api/analyses/{id}/profile` | 获取该分析的**最新**画像快照（无快照时 `404`） |
+| `GET /api/analyses/{id}/profiles` | 列出该分析的全部画像快照（摘要，版本倒序） |
+| `GET /api/analyses/{id}/profiles/{profile_id}` | 按画像 ID 获取指定快照（不属于该分析时 `404`） |
+
+```bash
+curl http://localhost:8000/api/analyses/1/profiles
+```
+
+```json
+{
+  "analysis_id": 1,
+  "total": 2,
+  "items": [
+    {
+      "id": 2, "version": 2,
+      "created_at": "2026-09-22T11:00:00+00:00",
+      "total_documents": 100, "valid_documents": 91, "invalid_documents": 9,
+      "compliance_rate": 0.91, "failure_groups": 4
+    }
+  ]
+}
+```
 
 ### `GET /health`
 

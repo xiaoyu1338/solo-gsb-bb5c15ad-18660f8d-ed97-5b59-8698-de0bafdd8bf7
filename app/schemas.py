@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.profile import MAX_PROFILE_DOCUMENTS
+
 
 class AnalysisCreate(BaseModel):
     """POST /api/analyses 请求体。"""
@@ -241,3 +243,74 @@ class GateResponse(BaseModel):
     exempted: list[GateExemptedIssue]
 
     model_config = {"populate_by_name": True}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/profile 合规画像
+# ---------------------------------------------------------------------------
+
+
+class ProfileCreate(BaseModel):
+    """POST /api/analyses/{id}/profile 请求体。"""
+
+    documents: list[dict[str, Any]] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_PROFILE_DOCUMENTS,
+        description=(
+            f"待检 JSON 文档列表（必须全部为 JSON 对象），"
+            f"数量 1..{MAX_PROFILE_DOCUMENTS}"
+        ),
+    )
+
+
+class ProfileFailure(BaseModel):
+    """画像中按位置 / 规则归并后的一组失败。"""
+
+    fingerprint: str = Field(..., description="稳定规则指纹（SHA-256 前 16 位）")
+    pointer: str = Field(..., description="失败位置（JSON Pointer，最深公共失败路径）")
+    validator: str = Field(..., description="jsonschema 校验规则名（如 required / type）")
+    schema_pointer: str = Field(..., description="schema 中触发规则的位置（JSON Pointer）")
+    message: str = Field(..., description="确定性的失败说明（不随输入顺序变化）")
+    count: int = Field(..., ge=0, description="命中该问题的文档数（每文档每指纹仅计一次）")
+    example_indices: list[int] = Field(
+        ..., description="示例文档下标（基于提交顺序，从 0 开始，升序且有界）"
+    )
+
+
+class ProfileSnapshot(BaseModel):
+    """画像结果快照（持久化内容）。"""
+
+    total_documents: int
+    valid_documents: int
+    invalid_documents: int
+    compliance_rate: float = Field(..., description="合规率：valid_documents / total_documents")
+    failures: list[ProfileFailure]
+
+
+class ProfileResponse(ProfileSnapshot):
+    """POST 画像 / GET 查询画像的响应。"""
+
+    id: int
+    analysis_id: int
+    version: int = Field(..., description="该分析下的画像版本号（从 1 开始递增）")
+    created_at: str
+
+
+class ProfileSummary(BaseModel):
+    """画像列表中的摘要条目。"""
+
+    id: int
+    version: int
+    created_at: str
+    total_documents: int
+    valid_documents: int
+    invalid_documents: int
+    compliance_rate: float
+    failure_groups: int
+
+
+class ProfileListResponse(BaseModel):
+    analysis_id: int
+    total: int
+    items: list[ProfileSummary]

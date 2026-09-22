@@ -7,9 +7,9 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, gate, sarif
+from app import compat, compare, gate, profile, sarif
 from app.database import get_db, init_db
-from app.models import Analysis
+from app.models import Analysis, AnalysisProfile
 from app.schemas import (
     AnalysisCreate,
     AnalysisListResponse,
@@ -18,6 +18,9 @@ from app.schemas import (
     CompareResponse,
     GateRequest,
     GateResponse,
+    ProfileCreate,
+    ProfileListResponse,
+    ProfileResponse,
 )
 
 
@@ -191,3 +194,105 @@ def export_analysis_sarif(analysis_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
     document = sarif.build_sarif(row.to_dict())
     return JSONResponse(content=document, media_type="application/sarif+json")
+
+
+# ---------------------------------------------------------------------------
+# 合规画像（profiling）
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/profile",
+    response_model=ProfileResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["analyses"],
+    summary="对分析的新 schema 执行批量文档合规画像",
+)
+def create_profile(analysis_id: int, payload: ProfileCreate, db: Session = Depends(get_db)):
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+
+    snapshot = profile.profile_documents(row.new_schema, payload.documents)
+
+    # version 在该分析下递增；并发画像各自取号，唯一约束兜底
+    latest = db.scalars(
+        select(AnalysisProfile.version)
+        .where(AnalysisProfile.analysis_id == analysis_id)
+        .order_by(AnalysisProfile.version.desc())
+        .limit(1)
+    ).first()
+    record = AnalysisProfile(
+        analysis_id=analysis_id,
+        version=(latest or 0) + 1,
+        snapshot=snapshot,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record.to_dict()
+
+
+@app.get(
+    "/api/analyses/{analysis_id}/profile",
+    response_model=ProfileResponse,
+    tags=["analyses"],
+    summary="获取分析的最新合规画像快照",
+)
+def get_latest_profile(analysis_id: int, db: Session = Depends(get_db)):
+    if db.get(Analysis, analysis_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    record = db.scalars(
+        select(AnalysisProfile)
+        .where(AnalysisProfile.analysis_id == analysis_id)
+        .order_by(AnalysisProfile.version.desc())
+        .limit(1)
+    ).first()
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="画像快照不存在")
+    return record.to_dict()
+
+
+@app.get(
+    "/api/analyses/{analysis_id}/profiles",
+    response_model=ProfileListResponse,
+    tags=["analyses"],
+    summary="列出分析的全部画像快照（摘要）",
+)
+def list_profiles(analysis_id: int, db: Session = Depends(get_db)):
+    if db.get(Analysis, analysis_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    rows = db.scalars(
+        select(AnalysisProfile)
+        .where(AnalysisProfile.analysis_id == analysis_id)
+        .order_by(AnalysisProfile.version.desc())
+    ).all()
+    items = [
+        {
+            "id": row.id,
+            "version": row.version,
+            "created_at": row.created_at.isoformat(),
+            "total_documents": row.snapshot["total_documents"],
+            "valid_documents": row.snapshot["valid_documents"],
+            "invalid_documents": row.snapshot["invalid_documents"],
+            "compliance_rate": row.snapshot["compliance_rate"],
+            "failure_groups": len(row.snapshot.get("failures", [])),
+        }
+        for row in rows
+    ]
+    return {"analysis_id": analysis_id, "total": len(items), "items": items}
+
+
+@app.get(
+    "/api/analyses/{analysis_id}/profiles/{profile_id}",
+    response_model=ProfileResponse,
+    tags=["analyses"],
+    summary="按画像 ID 获取指定画像快照",
+)
+def get_profile(analysis_id: int, profile_id: int, db: Session = Depends(get_db)):
+    if db.get(Analysis, analysis_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    record = db.get(AnalysisProfile, profile_id)
+    if record is None or record.analysis_id != analysis_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="画像快照不存在")
+    return record.to_dict()
