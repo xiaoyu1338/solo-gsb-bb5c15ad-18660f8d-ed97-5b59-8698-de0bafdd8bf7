@@ -492,3 +492,177 @@ def test_gate_does_not_modify_report(client):
     assert after["report"] == analysis["report"]
     assert after["old_schema"] == analysis["old_schema"]
     assert after["new_schema"] == analysis["new_schema"]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/profile 文档画像
+# ---------------------------------------------------------------------------
+
+PROFILE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "a": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+        "kind": {"oneOf": [
+            {"type": "object", "required": ["x"],
+             "properties": {"x": {"type": "string"}}},
+            {"type": "object", "required": ["y"],
+             "properties": {"y": {"type": "number"}}},
+        ]},
+        "name": {"type": "string"},
+    },
+    "required": ["name", "kind"],
+    "additionalProperties": False,
+}
+
+
+def _profile_analysis(client):
+    # new_schema 即画像使用的已保存新版 schema
+    return _create(client,
+                   {"type": "object"},
+                   PROFILE_SCHEMA,
+                   "profile-case")
+
+
+PROFILE_DOCS = [
+    {"name": "ok", "kind": {"x": "s"}},
+    {"name": "bad", "kind": {"x": 1}, "a": [1]},
+    {"name": 1, "kind": {"y": "no"}, "extra": 9},
+    {"a": [9], "kind": {}},
+]
+
+
+def test_profile_create_and_get(client):
+    analysis = _profile_analysis(client)
+    resp = client.post(f"/api/analyses/{analysis['id']}/profile",
+                       json={"documents": PROFILE_DOCS})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["analysis_id"] == analysis["id"]
+    assert data["total"] == 4
+    assert data["valid"] == 1
+    assert data["invalid"] == 3
+    assert data["compliance_rate"] == 0.25
+    assert "created_at" in data
+
+    by_key = {(g["path"], g["validator"]): g for g in data["failures"]}
+    # anyOf 同路径不同期望 -> 合并为 #/a 的 type
+    merged = by_key[("#/a", "type")]
+    assert merged["document_count"] == 2
+    assert merged["example_indices"] == [1, 3]
+    assert len(merged["fingerprint"]) == 16
+    # oneOf 分叉 -> #/kind oneOf
+    assert by_key[("#/kind", "oneOf")]["document_count"] == 2
+    # 每个组都有非空代表消息
+    assert all(g["message"] for g in data["failures"])
+
+    # 分组顺序稳定：按 (path, validator, fingerprint)
+    ordered = [(g["path"], g["validator"], g["fingerprint"]) for g in data["failures"]]
+    assert ordered == sorted(ordered)
+
+    # GET 查询到同一份持久化快照
+    resp2 = client.get(f"/api/analyses/{analysis['id']}/profile")
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json() == data
+
+
+def test_profile_uses_saved_new_schema(client):
+    # 画像只针对已保存的 new_schema：old 允许任意对象、new 要求必填 z
+    analysis = _create(client,
+                       {"type": "object"},
+                       {"type": "object", "required": ["z"]})
+    resp = client.post(f"/api/analyses/{analysis['id']}/profile",
+                       json={"documents": [{"other": 1}]})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["valid"] == 0 and data["invalid"] == 1
+    assert data["failures"][0]["validator"] == "required"
+    # 满足 new_schema 的对象通过
+    ok = client.post(f"/api/analyses/{analysis['id']}/profile",
+                     json={"documents": [{"z": 1}]}).json()
+    assert ok["valid"] == 1
+
+
+def test_profile_order_does_not_affect_groups(client):
+    analysis = _profile_analysis(client)
+    r1 = client.post(f"/api/analyses/{analysis['id']}/profile",
+                     json={"documents": PROFILE_DOCS}).json()
+    r2 = client.post(f"/api/analyses/{analysis['id']}/profile",
+                     json={"documents": list(reversed(PROFILE_DOCS))}).json()
+    keyf = lambda r: [(g["path"], g["validator"], g["fingerprint"],
+                       g["document_count"]) for g in r["failures"]]
+    assert keyf(r1) == keyf(r2)
+    assert r1["compliance_rate"] == r2["compliance_rate"]
+
+
+def test_profile_upsert_replaces_snapshot(client):
+    analysis = _profile_analysis(client)
+    client.post(f"/api/analyses/{analysis['id']}/profile",
+                json={"documents": PROFILE_DOCS})
+    # 再次提交：覆盖而非新增
+    resp = client.post(f"/api/analyses/{analysis['id']}/profile",
+                       json={"documents": [PROFILE_DOCS[0]]})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1 and data["valid"] == 1
+    assert data["failures"] == []
+    # GET 读到的是被覆盖后的最新快照
+    assert client.get(f"/api/analyses/{analysis['id']}/profile").json() == data
+
+
+def test_profile_get_404_when_missing_analysis(client):
+    assert client.post("/api/analyses/999999/profile",
+                       json={"documents": [{}]}).status_code == 404
+    assert client.get("/api/analyses/999999/profile").status_code == 404
+
+
+def test_profile_get_404_when_no_snapshot(client):
+    analysis = _profile_analysis(client)
+    resp = client.get(f"/api/analyses/{analysis['id']}/profile")
+    assert resp.status_code == 404
+    assert "画像" in resp.json()["detail"]
+
+
+def test_profile_over_limit_returns_422_and_does_not_write(client):
+    analysis = _profile_analysis(client)
+
+    # 空列表 -> 422
+    assert client.post(f"/api/analyses/{analysis['id']}/profile",
+                       json={"documents": []}).status_code == 422
+
+    # 超过 5000 -> 422
+    too_many = [{"name": "x", "kind": {"x": "s"}} for _ in range(5001)]
+    assert client.post(f"/api/analyses/{analysis['id']}/profile",
+                       json={"documents": too_many}).status_code == 422
+
+    # 非对象文档（数字 / 字符串 / 数组 / null）-> 422
+    for bad in ([1], ["s"], [[1]], [None]):
+        assert client.post(f"/api/analyses/{analysis['id']}/profile",
+                           json={"documents": bad}).status_code == 422
+
+    # 全部被拒：分析记录仍在，但画像快照未写入
+    assert client.get(f"/api/analyses/{analysis['id']}/profile").status_code == 404
+
+
+def test_profile_boundary_5000_accepted(client):
+    analysis = _profile_analysis(client)
+    docs = [{"name": "x", "kind": {"x": "s"}} for _ in range(5000)]
+    resp = client.post(f"/api/analyses/{analysis['id']}/profile",
+                       json={"documents": docs})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total"] == 5000
+    assert resp.json()["valid"] == 5000
+    assert resp.json()["compliance_rate"] == 1.0
+
+
+def test_profile_does_not_affect_other_endpoints(client):
+    # 画像写入后，分析报告 / SARIF / 门禁仍可正常读取，且报告未被修改
+    analysis = _profile_analysis(client)
+    before = client.get(f"/api/analyses/{analysis['id']}").json()
+    client.post(f"/api/analyses/{analysis['id']}/profile",
+                json={"documents": PROFILE_DOCS})
+
+    after = client.get(f"/api/analyses/{analysis['id']}").json()
+    assert after["report"] == before["report"]
+    assert client.get(f"/api/analyses/{analysis['id']}/sarif").status_code == 200
+    assert client.post(f"/api/analyses/{analysis['id']}/gate",
+                       json={"directions": ["backward"]}).status_code == 200

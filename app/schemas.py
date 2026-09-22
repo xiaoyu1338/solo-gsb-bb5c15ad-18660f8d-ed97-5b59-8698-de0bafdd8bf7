@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.profile import MAX_PROFILE_DOCUMENTS
+
 
 class AnalysisCreate(BaseModel):
     """POST /api/analyses 请求体。"""
@@ -241,3 +243,50 @@ class GateResponse(BaseModel):
     exempted: list[GateExemptedIssue]
 
     model_config = {"populate_by_name": True}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/profile 文档画像
+# ---------------------------------------------------------------------------
+
+
+class ProfileRequest(BaseModel):
+    """``POST /api/analyses/{id}/profile`` 请求体。
+
+    ``documents`` 为待检 JSON 文档列表：至少 1 个、最多
+    ``MAX_PROFILE_DOCUMENTS``（5000）个，且每个文档必须是 JSON 对象
+    （dict）；超限或包含非对象文档由 Pydantic 直接拒绝为 422，
+    不写入任何分析 / 画像记录。
+    """
+
+    documents: list[dict[str, Any]] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_PROFILE_DOCUMENTS,
+        description=f"待检 JSON 文档（对象），数量 1~{MAX_PROFILE_DOCUMENTS}",
+    )
+
+
+class ProfileFailureGroup(BaseModel):
+    """一条按 JSON Pointer 归并的失败规则。"""
+
+    path: str = Field(..., description="最深公共失败路径（JSON Pointer，根为 #）")
+    validator: str = Field(..., description="jsonschema 校验规则（oneOf/type/required…）")
+    fingerprint: str = Field(..., description="稳定规则指纹（与输入顺序、实例取值无关）")
+    document_count: int = Field(..., description="命中该失败的文档数（同一文档只计一次）")
+    example_indices: list[int] = Field(
+        ..., description="示例文档在提交列表中的下标（升序，最多保留 10 个最小下标）"
+    )
+    message: str = Field(..., description="代表性错误信息（同类中字典序最小，稳定）")
+
+
+class ProfileResponse(BaseModel):
+    """画像快照（创建与查询共用）。"""
+
+    analysis_id: int
+    total: int = Field(..., description="待检文档总数")
+    valid: int = Field(..., description="通过新版 schema 校验的文档数")
+    invalid: int = Field(..., description="未通过校验的文档数")
+    compliance_rate: float = Field(..., description="合规率 valid/total，保留 6 位小数")
+    failures: list[ProfileFailureGroup]
+    created_at: str = Field(..., description="快照创建时间（ISO 8601）")

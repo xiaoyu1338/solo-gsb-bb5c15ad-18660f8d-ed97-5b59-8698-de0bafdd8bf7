@@ -17,17 +17,19 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、文档画像、SARIF 导出
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
+│   ├── profile.py       # 文档画像（新版 schema 批量校验 + JSON Pointer 失败归并）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
 │   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
 │   ├── database.py      # SQLite / SQLAlchemy 初始化
-│   ├── models.py        # Analysis ORM 模型
+│   ├── models.py        # Analysis / Profile ORM 模型
 │   └── schemas.py       # Pydantic 请求 / 响应模型
 ├── tests/
 │   ├── test_compat.py   # 引擎单元测试（含 if/then/else 条件分支用例）
 │   ├── test_compare.py  # 基线对比单元测试
+│   ├── test_profile.py  # 文档画像引擎单元测试（oneOf/anyOf 最深公共路径）
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
 ├── Dockerfile
@@ -554,6 +556,117 @@ curl -X POST http://localhost:8000/api/analyses/1/gate \
 
 请求体不合法（如 `directions` 为空、规则 `path` 不是合法 JSON Pointer、
 上限为负数）返回 `422`。
+
+### `POST /api/analyses/{id}/profile` — 文档画像
+
+对一份**已保存的分析**，用其**新版 schema**（`new_schema`）批量校验最多
+**5000 个待检 JSON 文档**，返回**合规率**与按 **JSON Pointer** 归并的失败计数、
+示例下标。画像结果作为快照与分析记录**关联持久化**（每个分析仅保留一份，
+重复提交覆盖旧快照）；分析编号不存在返回 `404`。
+
+请求体：
+
+| 字段        | 类型     | 必填 | 说明                                         |
+| ----------- | -------- | ---- | -------------------------------------------- |
+| `documents` | object[] | 是   | 待检 JSON 文档（必须都是对象），数量 1~5000 |
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "documents": [
+      {"name": "ok", "kind": {"x": "s"}},
+      {"name": "bad", "kind": {"x": 1}, "a": [1]},
+      {"a": [9], "kind": {}}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "analysis_id": 1,
+  "total": 3,
+  "valid": 1,
+  "invalid": 2,
+  "compliance_rate": 0.333333,
+  "failures": [
+    {
+      "path": "#/a",
+      "validator": "type",
+      "fingerprint": "99cdb317170423fd",
+      "document_count": 2,
+      "example_indices": [1, 2],
+      "message": "[1] is not of type 'integer'"
+    },
+    {
+      "path": "#/kind",
+      "validator": "oneOf",
+      "fingerprint": "6aad9a5c72d2e492",
+      "document_count": 2,
+      "example_indices": [1, 2],
+      "message": "'no' is not of type 'number'"
+    }
+  ],
+  "created_at": "2026-09-22T10:00:00+00:00"
+}
+```
+
+字段说明：
+
+| 字段                | 说明                                                           |
+| ------------------- | -------------------------------------------------------------- |
+| `total/valid/invalid` | 待检 / 通过 / 未通过新版 schema 的文档数                     |
+| `compliance_rate`   | 合规率 `valid/total`，保留 6 位小数                            |
+| `failures[].path`   | 最深公共失败路径（实例 JSON Pointer，根为 `#`）                |
+| `failures[].validator` | jsonschema 规则名（`type` / `required` / `oneOf` …）         |
+| `failures[].fingerprint` | **稳定规则指纹**（见下），与输入顺序、实例取值无关          |
+| `failures[].document_count` | 命中该失败的**文档数**（同一文档内同指纹只计一次）       |
+| `failures[].example_indices` | 示例文档在提交列表中的下标（升序，最多保留 10 个最小下标）|
+| `failures[].message` | 代表性错误信息（同类中取字典序最小，稳定）                    |
+
+**输入校验（422，且不写入任何分析 / 画像记录）**：`documents` 为空或
+**超过 5000 个**、或其中任一文档**不是 JSON 对象**（数字 / 字符串 / 数组 /
+null）时，Pydantic 直接返回 `422`，不落库。
+
+#### `oneOf` / `anyOf` 嵌套错误的最深公共失败路径
+
+jsonschema 对组合关键字失败会生成一棵错误树（顶层 `oneOf`/`anyOf` 节点的
+`context` 内是各分支错误，分支内可继续嵌套）。画像引擎把每棵树归并为规则：
+
+1. 收集全部**叶子错误**；`false` 分支的叶子 `validator` 为 `null`，记为
+   `false_schema`；
+2. **叶子同路径、同规则**时（如
+   `anyOf:[{type:string},{type:integer}]` 对一个数组取值的失败，两分支都报
+   `#/a` 上的 `type`），失败定位到该路径的具体规则，指纹主体取各分支
+   规则值的**规范并集**；
+3. **否则**取所有叶子实例路径的**最长公共前缀**作为最深公共失败路径，
+   并选择在 schema 路径上**覆盖全部叶子的最顶层组合节点**作为归并规则：
+   例如文档分别在 `#/a`、`#/b` 两个分支失败时，路径归并到 `#`、规则归并到
+   拥有它们的 `oneOf`；`oneOf` 多分支同时命中则记 `multiple_matches`。
+
+**稳定规则指纹**为
+`SHA-256("<instance pointer>\\x1f<validator>\\x1f<subject>")` 前 16 位：
+
+- `type` / `enum` / `const` / `minimum` 等数据无关规则：主体是规则值的
+  规范 JSON（排序键）；
+- `required`：主体是该叶子实际缺失的属性名（不同缺失字段是不同指纹）；
+- `additionalProperties: false`：不同多余字段名同属一类；
+- 同路径同规则的组合归并：主体为各分支规则值的规范并集；
+- 分歧归并：主体为 `branch_mismatch`。
+
+因此**打乱待检文档顺序不改变分组集合与分组顺序**（分组按
+`(path, validator, fingerprint)` 稳定排序），只影响示例下标本身。
+
+### `GET /api/analyses/{id}/profile` — 查询画像快照
+
+返回与 `POST` 完全相同的快照结构。分析不存在返回 `404`；分析存在但**尚未
+生成画像**时也返回 `404`（`{"detail": "该分析尚未生成文档画像快照"}`）。
+
+```bash
+curl http://localhost:8000/api/analyses/1/profile
+```
 
 ### `GET /health`
 

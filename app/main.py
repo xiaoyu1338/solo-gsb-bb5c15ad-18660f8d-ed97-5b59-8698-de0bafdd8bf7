@@ -7,9 +7,9 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, gate, sarif
+from app import compat, compare, gate, profile, sarif
 from app.database import get_db, init_db
-from app.models import Analysis
+from app.models import Analysis, Profile
 from app.schemas import (
     AnalysisCreate,
     AnalysisListResponse,
@@ -18,6 +18,8 @@ from app.schemas import (
     CompareResponse,
     GateRequest,
     GateResponse,
+    ProfileRequest,
+    ProfileResponse,
 )
 
 
@@ -157,6 +159,56 @@ def evaluation_gate(analysis_id: int, payload: GateRequest, db: Session = Depend
     )
     return {"passed": result["pass"], "counts": result["counts"],
             "blocking": result["blocking"], "exempted": result["exempted"]}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/profile",
+    response_model=ProfileResponse,
+    tags=["analyses"],
+    summary="文档画像：用新版 schema 批量校验待检文档",
+)
+def create_profile(analysis_id: int, payload: ProfileRequest, db: Session = Depends(get_db)):
+    # 请求体（超限 / 非对象文档）在进入本函数前已被 Pydantic 拒绝为 422，
+    # 因此这里只有合法请求，任何校验失败都不会落库。
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+
+    snapshot = profile.profile_documents(row.new_schema, payload.documents)
+
+    # 同一分析只保留一份画像快照：存在则覆盖，否则新建（upsert）
+    record = db.scalars(
+        select(Profile).where(Profile.analysis_id == analysis_id)
+    ).one_or_none()
+    if record is None:
+        record = Profile(analysis_id=analysis_id)
+        db.add(record)
+    record.total = snapshot["total"]
+    record.valid = snapshot["valid"]
+    record.invalid = snapshot["invalid"]
+    record.compliance_rate = snapshot["compliance_rate"]
+    record.failures = snapshot["failures"]
+    db.commit()
+    db.refresh(record)
+    return record.to_dict()
+
+
+@app.get(
+    "/api/analyses/{analysis_id}/profile",
+    response_model=ProfileResponse,
+    tags=["analyses"],
+    summary="获取分析关联的文档画像快照",
+)
+def get_profile(analysis_id: int, db: Session = Depends(get_db)):
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    if row.profile is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="该分析尚未生成文档画像快照",
+        )
+    return row.profile.to_dict()
 
 
 @app.get(
